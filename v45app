@@ -1,0 +1,769 @@
+import os
+import time
+import re
+import threading
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# Configuración de CustomTkinter
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+class CDSSApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("CDSS Tissunómico V45.0 - Motor Espacial Definitivo")
+        self.geometry("1100x800")
+        self.minsize(900, 700)
+
+        self.csv_path = None
+        self.export_dir = None
+        self.parsed_data = {}
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        # Grid layout: 1 fila, 2 columnas (Sidebar + Contenido principal)
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+
+        # ==========================================
+        # SIDEBAR (Parámetros)
+        # ==========================================
+        self.sidebar_frame = ctk.CTkFrame(self, width=250, corner_radius=0)
+        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_frame.grid_rowconfigure(13, weight=1)
+
+        self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Configuración\nClínica", font=ctk.CTkFont(size=20, weight="bold"))
+        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+
+        # Parámetros Clínicos
+        self._add_param_input("Área Analizada (mm²):", "1.0", 1, "area_var")
+        self._add_param_input("Factor Escala ISTB:", "2.5", 2, "escala_var")
+        self._add_param_input("EC50 (Punto Inflexión):", "5.0", 3, "ec50_var")
+        self._add_param_input("k (Pendiente Sigmoide):", "0.5", 4, "k_var")
+        self._add_param_input("Lambda λ (Difusión µm):", "40.0", 5, "lambda_var")
+
+        # Origen Biopsia
+        self.origen_label = ctk.CTkLabel(self.sidebar_frame, text="Origen de la Biopsia:", anchor="w")
+        self.origen_label.grid(row=11, column=0, padx=20, pady=(10, 0), sticky="w")
+        self.origen_var = ctk.StringVar(value="Metástasis")
+        self.origen_menu = ctk.CTkOptionMenu(self.sidebar_frame, values=["Metástasis", "Primaria"], variable=self.origen_var)
+        self.origen_menu.grid(row=12, column=0, padx=20, pady=(0, 10), sticky="ew")
+
+        # ==========================================
+        # MAIN CONTENT
+        # ==========================================
+        self.main_frame = ctk.CTkFrame(self, corner_radius=10, fg_color="transparent")
+        self.main_frame.grid(row=0, column=1, sticky="nsew", padx=30, pady=30)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        self.main_frame.grid_rowconfigure(4, weight=1) # El textbox en la fila 4 será el que se expanda
+
+        # Títulos
+        self.title_lbl = ctk.CTkLabel(self.main_frame, text="Generador de Matriz Tissunómica", font=ctk.CTkFont(size=28, weight="bold"))
+        self.title_lbl.grid(row=0, column=0, pady=(0, 5), sticky="w")
+        
+        self.subtitle_lbl = ctk.CTkLabel(self.main_frame, text="Versión 45.0 - Edición Definitiva Espacial (Fick + DAB Continuo)", font=ctk.CTkFont(size=14, slant="italic"), text_color="gray")
+        self.subtitle_lbl.grid(row=1, column=0, pady=(0, 20), sticky="w")
+
+        # CSV Seleccion
+        self.csv_frame = ctk.CTkFrame(self.main_frame, fg_color="#2b2b2b", corner_radius=8)
+        self.csv_frame.grid(row=2, column=0, sticky="ew", pady=(0, 20), ipadx=10, ipady=5)
+        self.csv_frame.grid_columnconfigure(1, weight=1)
+
+        self.btn_select_csv = ctk.CTkButton(self.csv_frame, text="Seleccionar CSV de QuPath", command=self.select_csv, width=200, height=40, font=ctk.CTkFont(weight="bold"))
+        self.btn_select_csv.grid(row=0, column=0, padx=20, pady=15, sticky="w")
+
+        self.lbl_csv_path = ctk.CTkLabel(self.csv_frame, text="Ningún archivo seleccionado", text_color="gray", wraplength=400)
+        self.lbl_csv_path.grid(row=0, column=1, padx=10, sticky="w")
+
+        # Export Selection
+        self.export_frame = ctk.CTkFrame(self.main_frame, fg_color="#2b2b2b", corner_radius=8)
+        self.export_frame.grid(row=3, column=0, sticky="ew", pady=(0, 20), ipadx=10, ipady=5)
+        self.export_frame.grid_columnconfigure(1, weight=1)
+
+        self.btn_select_export = ctk.CTkButton(self.export_frame, text="Carpeta de Destino", command=self.select_export, width=200, height=40, font=ctk.CTkFont(weight="bold"))
+        self.btn_select_export.grid(row=0, column=0, padx=20, pady=15, sticky="w")
+
+        self.lbl_export_path = ctk.CTkLabel(self.export_frame, text="(Opcional) Por defecto: Misma carpeta que el CSV", text_color="gray", wraplength=400)
+        self.lbl_export_path.grid(row=0, column=1, padx=10, sticky="w")
+
+        # Log Textbox
+        self.log_lbl = ctk.CTkLabel(self.main_frame, text="Pegar aquí la información del terminal (Log de Groovy):", font=ctk.CTkFont(weight="bold"))
+        self.log_lbl.grid(row=4, column=0, sticky="sw", pady=(0, 5))
+
+        self.textbox_log = ctk.CTkTextbox(self.main_frame)
+        self.textbox_log.grid(row=5, column=0, sticky="nsew", pady=(0, 15))
+        self.textbox_log.bind("<KeyRelease>", self.parse_log)
+        
+        self.main_frame.grid_rowconfigure(4, weight=0)
+        self.main_frame.grid_rowconfigure(5, weight=1) # El textbox en la fila 5 será el que se expanda
+
+        # Parsed Data Result Frame
+        self.parsed_frame = ctk.CTkFrame(self.main_frame, fg_color="#333333", corner_radius=8)
+        self.parsed_frame.grid(row=6, column=0, sticky="ew", pady=(0, 20), ipady=5)
+        self.lbl_parsed_info = ctk.CTkLabel(self.parsed_frame, text="Esperando datos...", text_color="orange", font=ctk.CTkFont(weight="bold"))
+        self.lbl_parsed_info.pack(pady=10)
+
+        # Generate Button & Progress
+        self.progress_bar = ctk.CTkProgressBar(self.main_frame, mode="determinate")
+        self.progress_bar.grid(row=7, column=0, sticky="ew", pady=(0, 10))
+        self.progress_bar.set(0)
+
+        self.lbl_status = ctk.CTkLabel(self.main_frame, text="Listo.")
+        self.lbl_status.grid(row=8, column=0, sticky="w")
+
+        self.btn_generate = ctk.CTkButton(self.main_frame, text="GENERAR EXCEL DEFINITIVO", command=self.start_generation, height=50, font=ctk.CTkFont(size=18, weight="bold"), fg_color="#27ae60", hover_color="#2ecc71")
+        self.btn_generate.grid(row=9, column=0, sticky="ew", pady=(10, 0))
+
+    def _add_param_input(self, label_text, default_val, row, var_name):
+        lbl = ctk.CTkLabel(self.sidebar_frame, text=label_text, anchor="w")
+        lbl.grid(row=row*2-1, column=0, padx=20, pady=(10, 0), sticky="w")
+        var = ctk.StringVar(value=default_val)
+        entry = ctk.CTkEntry(self.sidebar_frame, textvariable=var)
+        entry.grid(row=row*2, column=0, padx=20, pady=(0, 5), sticky="ew")
+        setattr(self, var_name, var)
+
+    def select_csv(self):
+        filename = filedialog.askopenfilename(
+            title="Seleccionar matriz CSV exportada por QuPath",
+            filetypes=(("Archivos CSV", "*.csv"), ("Todos los archivos", "*.*"))
+        )
+        if filename:
+            self.csv_path = filename
+            self.lbl_csv_path.configure(text=filename, text_color="white")
+
+    def select_export(self):
+        folder = filedialog.askdirectory(title="Seleccionar carpeta de destino")
+        if folder:
+            self.export_dir = folder
+            self.lbl_export_path.configure(text=folder, text_color="white")
+
+    def parse_log(self, event=None):
+        text = self.textbox_log.get("1.0", "end-1c")
+        
+        patterns = {
+            "Células": r"Células tumorales encontradas:\s*(\d+)",
+            "Calibración": r"Calibración detectada:\s*([\d.]+)",
+            "Min": r"Min\s*=\s*([\d.]+)",
+            "P25": r"P25\s*=\s*([\d.]+)",
+            "P50": r"P50\s*=\s*([\d.]+)",
+            "P75": r"P75\s*=\s*([\d.]+)",
+            "P90": r"P90\s*=\s*([\d.]+)",
+            "P95": r"P95\s*=\s*([\d.]+)",
+            "Max": r"Max\s*=\s*([\d.]+)",
+            "Mean": r"Mean\s*=\s*([\d.]+)"
+        }
+
+        parsed = {}
+        for key, pattern in patterns.items():
+            match = re.search(pattern, text)
+            if match:
+                parsed[key] = match.group(1)
+        
+        self.parsed_data = parsed
+
+        if len(parsed) == 10:
+            info_str = f"✅ Datos extraídos correctamente | Células: {parsed['Células']} | Calibración: {parsed['Calibración']} | Mean DAB: {parsed['Mean']}"
+            self.lbl_parsed_info.configure(text=info_str, text_color="#2ecc71")
+        elif len(parsed) > 0:
+            info_str = f"⚠️ Datos parciales extraídos ({len(parsed)}/10)... Siga pegando o verifique el log."
+            self.lbl_parsed_info.configure(text=info_str, text_color="yellow")
+        else:
+            self.lbl_parsed_info.configure(text="Esperando datos...", text_color="orange")
+
+    def update_progress(self, value, text):
+        self.progress_bar.set(value)
+        self.lbl_status.configure(text=text)
+        self.update_idletasks()
+
+    def start_generation(self):
+        if not self.csv_path:
+            messagebox.showerror("Error", "Debe seleccionar el archivo CSV generado por QuPath.")
+            return
+        
+        if len(self.parsed_data) < 10:
+            ans = messagebox.askyesno("Aviso", "No se han detectado todas las estadísticas en el log. ¿Desea continuar de todos modos?\n(Las estadísticas globales quedarán en blanco en el reporte).")
+            if not ans:
+                return
+
+        # Disable UI
+        self.btn_generate.configure(state="disabled", text="GENERANDO...")
+        threading.Thread(target=self.generate_excel, daemon=True).start()
+
+    def generate_excel(self):
+        try:
+            start_time = time.time()
+            self.update_progress(0.05, "1. Leyendo CSV del Groovy...")
+            
+            df = pd.read_csv(self.csv_path, sep=';', decimal=',', encoding='utf-8-sig')
+            total_cells = len(df)
+            
+            self.update_progress(0.2, f"Células cargadas: {total_cells}")
+
+            wb = Workbook()
+
+            # =====================================================================
+            # FORMATOS
+            # =====================================================================
+            title_font = Font(bold=True, size=16, color="FFFFFF")
+            subtitle_font = Font(italic=True, size=10, color="7F8C8D")
+            block_font = Font(bold=True, size=12, color="FFFFFF")
+            header_font = Font(bold=True, size=10, color="FFFFFF")
+            label_font = Font(bold=True, size=10)
+            guide_font = Font(italic=True, size=9, color="34495E")
+            calc_header_font = Font(bold=True, size=10, color="FFFFFF")
+
+            dark_fill = PatternFill("solid", fgColor="2C3E50")
+            block_fill = PatternFill("solid", fgColor="1F497D")
+            header_fill = PatternFill("solid", fgColor="34495E")
+            label_fill = PatternFill("solid", fgColor="ECF0F1")
+            input_fill = PatternFill("solid", fgColor="FFF3CD")
+            guide_fill = PatternFill("solid", fgColor="F8F9FA")
+            calc_fill = PatternFill("solid", fgColor="D35400")
+            green_fill = PatternFill("solid", fgColor="27AE60")
+            ai_fill = PatternFill("solid", fgColor="F1C40F")
+
+            thin_border = Border(
+                left=Side(style='thin'), right=Side(style='thin'),
+                top=Side(style='thin'), bottom=Side(style='thin')
+            )
+
+            center_align = Alignment(horizontal='center', vertical='center')
+            left_align = Alignment(horizontal='left', vertical='center')
+            wrap_align = Alignment(horizontal='left', vertical='top', wrap_text=True)
+
+            def style_cell(ws, row, col, value, font=None, fill=None, align=center_align, fmt=None):
+                cell = ws.cell(row=row, column=col, value=value)
+                cell.border = thin_border
+                if font: cell.font = font
+                if fill: cell.fill = fill
+                if align: cell.alignment = align
+                if fmt: cell.number_format = fmt
+                return cell
+
+            def write_block_title(ws, row, title, cols=5):
+                for c in range(2, 2 + cols):
+                    cell = ws.cell(row=row, column=c)
+                    cell.fill = block_fill
+                    cell.font = block_font
+                    cell.border = thin_border
+                    cell.alignment = center_align
+                ws.cell(row=row, column=2, value=title)
+
+            def write_guide(ws, row_start, row_end, text):
+                ws.merge_cells(start_row=row_start, start_column=6, end_row=row_end, end_column=6)
+                cell = ws.cell(row=row_start, column=6, value=text)
+                cell.font = guide_font
+                cell.fill = guide_fill
+                cell.alignment = wrap_align
+                cell.border = thin_border
+
+            # Helpers para inyectar UI stats
+            p = self.parsed_data
+            def safe_float(v, default):
+                try: return float(v)
+                except: return default
+
+            # =====================================================================
+            # HOJA 2: DASHBOARD CLÍNICO (Se crea primero para que sea la hoja activa)
+            # =====================================================================
+            ws2 = wb.active
+            ws2.title = "Dashboard Clinico V45"
+
+            ws2.column_dimensions['A'].width = 2
+            ws2.column_dimensions['B'].width = 48
+            ws2.column_dimensions['C'].width = 20
+            ws2.column_dimensions['D'].width = 22
+            ws2.column_dimensions['E'].width = 16
+            ws2.column_dimensions['F'].width = 90
+
+            # Título
+            ws2.merge_cells('B1:E1')
+            style_cell(ws2, 1, 2, "CDSS TISSUNÓMICO V45.0 — Dashboard Clínico Definitivo", title_font, dark_fill)
+            for c in range(3, 6): ws2.cell(row=1, column=c).fill = dark_fill
+
+            # ─── BLOQUE 1: UMBRALES IHC Y PERCENTILES ───
+            write_block_title(ws2, 2, "BLOQUE 1: UMBRALES IHC PARAMÉTRICA Y PERCENTILES")
+            style_cell(ws2, 3, 2, "Umbral DAB Negative/0+ (Ultralow)", label_font, label_fill, left_align)
+            style_cell(ws2, 3, 3, 0.03, label_font, input_fill, center_align, '0.0000')
+            style_cell(ws2, 3, 4, "P25 de la muestra:", label_font, label_fill, left_align)
+            val_p25 = safe_float(p.get("P25"), None) if "P25" in p else None
+            style_cell(ws2, 3, 5, val_p25, label_font, input_fill, center_align, '0.0000')
+
+            style_cell(ws2, 4, 2, "Umbral DAB 0+/1+ (HER2-Low)", label_font, label_fill, left_align)
+            style_cell(ws2, 4, 3, 0.065, label_font, input_fill, center_align, '0.0000')
+            style_cell(ws2, 4, 4, "P50 (Mediana):", label_font, label_fill, left_align)
+            val_p50 = safe_float(p.get("P50"), None) if "P50" in p else None
+            style_cell(ws2, 4, 5, val_p50, label_font, input_fill, center_align, '0.0000')
+
+            style_cell(ws2, 5, 2, "Umbral DAB 1+/2+ (Equívoco)", label_font, label_fill, left_align)
+            style_cell(ws2, 5, 3, 0.15, label_font, input_fill, center_align, '0.0000')
+            style_cell(ws2, 5, 4, "P75 de la muestra:", label_font, label_fill, left_align)
+            val_p75 = safe_float(p.get("P75"), None) if "P75" in p else None
+            style_cell(ws2, 5, 5, val_p75, label_font, input_fill, center_align, '0.0000')
+
+            style_cell(ws2, 6, 2, "Umbral DAB 2+/3+ (Sobreexpresión)", label_font, label_fill, left_align)
+            style_cell(ws2, 6, 3, 0.30, label_font, input_fill, center_align, '0.0000')
+            style_cell(ws2, 6, 4, "P90 de la muestra:", label_font, label_fill, left_align)
+            val_p90 = safe_float(p.get("P90"), None) if "P90" in p else None
+            style_cell(ws2, 6, 5, val_p90, label_font, input_fill, center_align, '0.0000')
+
+            style_cell(ws2, 7, 2, "", None, None, None)
+            style_cell(ws2, 7, 4, "P95 de la muestra:", label_font, label_fill, left_align)
+            val_p95 = safe_float(p.get("P95"), None) if "P95" in p else None
+            style_cell(ws2, 7, 5, val_p95, label_font, input_fill, center_align, '0.0000')
+
+            style_cell(ws2, 8, 2, "", None, None, None)
+            style_cell(ws2, 8, 4, "Mean de la muestra:", label_font, label_fill, left_align)
+            val_mean = safe_float(p.get("Mean"), None) if "Mean" in p else None
+            style_cell(ws2, 8, 5, val_mean, label_font, input_fill, center_align, '0.0000')
+
+            write_guide(ws2, 2, 8,
+                "GUÍA BLOQUE 1 — UMBRALES IHC PARAMÉTRICA:\n"
+                "Los umbrales (columna C) convierten la señal DAB continua en categorías IHC equivalentes "
+                "(Negative, 0+, 1+, 2+, 3+). Se calibran comparando los percentiles DAB tumorales "
+                "(columna E, copiados manualmente del Groovy) con los puntos de referencia del tutorial "
+                "QuPath HER2 (DAB thresholds 0.03/0.10/0.30 para 1+/2+/3+).\n\n"
+                "• Wolff et al. (JCO 2023): Criterios ASCO/CAP para HER2.\n"
+                "• Tarantino et al. (npj Precis Oncol 2026): La IHC categórica sub-predice la eficacia "
+                "del T-DXd frente a scores cuantitativos continuos (HS-HER2, RPPA, HER2DX).\n"
+                "• He et al. (AIMM 2026): Cytoplasm DAB OD mean captura la señal de membrana por "
+                "spillover cromogénico. QH-DAB con Qymia/QuPath tiene LOD de 667 amol/mm².\n"
+                "• Los percentiles se copian manualmente de la salida del Groovy para cada muestra."
+            )
+
+            # ─── BLOQUE 2: CONSTANTES DEL MODELO ───
+            write_block_title(ws2, 10, "BLOQUE 2: CONSTANTES DEL MODELO ESPACIAL")
+            style_cell(ws2, 11, 2, "Factor de Escala Logarítmico", label_font, label_fill, left_align)
+            style_cell(ws2, 11, 3, safe_float(self.escala_var.get(), 3.0), label_font, input_fill, center_align, '0.0')
+            style_cell(ws2, 12, 2, "EC50 (Punto inflexión Sigmoide)", label_font, label_fill, left_align)
+            style_cell(ws2, 12, 3, safe_float(self.ec50_var.get(), 1.5), label_font, input_fill, center_align, '0.0')
+            style_cell(ws2, 13, 2, "Pendiente k (Hill)", label_font, label_fill, left_align)
+            style_cell(ws2, 13, 3, safe_float(self.k_var.get(), 0.8), label_font, input_fill, center_align, '0.0')
+            style_cell(ws2, 14, 2, "Lambda λ (Difusión DXd en µm)", label_font, label_fill, left_align)
+            style_cell(ws2, 14, 3, safe_float(self.lambda_var.get(), 40.0), label_font, input_fill, center_align, '0')
+
+            write_guide(ws2, 10, 14,
+                "GUÍA BLOQUE 2 — CONSTANTES FARMACODINÁMICAS:\n"
+                "• Lambda (40 µm): Alcance de difusión del DXd libre. Khera et al. (MCT 2022): "
+                "payloads lipofílicos penetran 30-80 µm (2-5 capas celulares).\n"
+                "• Factor de Escala (3.0): Expande el rango del logaritmo para resolución clínica.\n"
+                "• EC50 (1.5): Punto de inflexión de la sigmoide dosis-respuesta.\n"
+                "• k (0.8): Pendiente de Hill. Modela la transición abrupta/gradual.\n\n"
+                "Todos son parámetros hipotéticos in silico. Se calibran para que la Tasa de "
+                "Destrucción Total se aproxime a las ORR de DESTINY-Breast04 (Modi, NEJM 2022) "
+                "y DESTINY-Breast06 (Bardia, NEJM 2024).\n"
+                "• Burton et al. (AAPS J 2019) y Vasalou et al. (PLoS One 2015) validan el marco QSP."
+            )
+
+            # ─── BLOQUE 3: P DIRECTA Y DESTINOS ───
+            write_block_title(ws2, 16, "BLOQUE 3: PROBABILIDAD DIRECTA Y UMBRALES DE DESTINO")
+            style_cell(ws2, 17, 2, "P Directa Negative (sin diana)", label_font, label_fill, left_align)
+            style_cell(ws2, 17, 3, 0.00, label_font, label_fill, center_align, '0.00')
+            style_cell(ws2, 18, 2, "P Directa 0+ (HER2-Ultralow)", label_font, label_fill, left_align)
+            style_cell(ws2, 18, 3, 0.05, label_font, input_fill, center_align, '0.00')
+            style_cell(ws2, 19, 2, "P Directa 1+ (HER2-Low)", label_font, label_fill, left_align)
+            style_cell(ws2, 19, 3, 0.35, label_font, input_fill, center_align, '0.00')
+            style_cell(ws2, 20, 2, "P Directa 2+ (Equívoco)", label_font, label_fill, left_align)
+            style_cell(ws2, 20, 3, 0.55, label_font, input_fill, center_align, '0.00')
+            style_cell(ws2, 21, 2, "P Directa 3+ (Sobreexpresión)", label_font, label_fill, left_align)
+            style_cell(ws2, 21, 3, 0.80, label_font, input_fill, center_align, '0.00')
+            style_cell(ws2, 22, 2, "", None, None, None)
+
+            style_cell(ws2, 23, 2, "Límite Rescate Parcial (P Comb. >)", label_font, label_fill, left_align)
+            style_cell(ws2, 23, 3, 0.30, label_font, input_fill, center_align, '0.00')
+            style_cell(ws2, 24, 2, "Límite Destrucción Probable (>)", label_font, label_fill, left_align)
+            style_cell(ws2, 24, 3, 0.60, label_font, input_fill, center_align, '0.00')
+            style_cell(ws2, 25, 2, "Límite Destrucción Letal (>)", label_font, label_fill, left_align)
+            style_cell(ws2, 25, 3, 0.85, label_font, input_fill, center_align, '0.00')
+
+            write_guide(ws2, 16, 25,
+                "GUÍA BLOQUE 3 — VÍA DIRECTA Y DESTINOS:\n"
+                "La P Directa modela la internalización del ADC por la propia célula según su "
+                "nivel de expresión HER2. Los valores derivan de las ORR observadas:\n"
+                "• 3+ ORR 79% (DESTINY-Breast03, Cortés et al., Nat Med 2024)\n"
+                "• 2+ ORR ~55% (DESTINY-Breast04 subgrupo 2+/ISH-)\n"
+                "• 1+ ORR ~35% (DESTINY-Breast04, Modi et al., NEJM 2022)\n"
+                "• 0+ ORR ~5% (DESTINY-Breast06 ultralow, Bardia et al., NEJM 2024)\n"
+                "• Negative: 0% por vía directa (sin receptor).\n\n"
+                "Los umbrales de destino estratifican la P Combinada en categorías accionables.\n"
+                "• Goni et al. (Eur J Immunol 2026): La heterogeneidad espacial del antígeno "
+                "es el factor limitante principal de la eficacia de los ADCs."
+            )
+
+            # ─── BLOQUE 4: RIESGO PREANALÍTICO ───
+            write_block_title(ws2, 27, "BLOQUE 4: RIESGO PREANALÍTICO")
+            style_cell(ws2, 28, 2, "Origen de la Biopsia", label_font, label_fill, left_align)
+            style_cell(ws2, 28, 3, self.origen_var.get(), label_font, input_fill, center_align)
+            style_cell(ws2, 29, 2, "Concordancia HER2 entre biopsias", label_font, label_fill, left_align)
+            style_cell(ws2, 29, 3, "Sí", label_font, input_fill, center_align)
+            style_cell(ws2, 30, 2, "Alerta Preanalítica", label_font, label_fill, left_align)
+            ws2.cell(row=30, column=3).value = '=IF(C28="Primaria","⚠️ Riesgo discordancia ~20%","✅ Contemporánea")'
+            ws2.cell(row=30, column=3).font = Font(bold=True, size=11)
+            ws2.cell(row=30, column=3).alignment = center_align
+
+            write_guide(ws2, 27, 30,
+                "GUÍA BLOQUE 4 — RIESGO PREANALÍTICO:\n"
+                "• Zou et al. (HEROIC, ASCO 2025, n=3546): 20.2% discordancia HER2 entre "
+                "primario y metástasis. ORR 55.7% vs 13.0% según concordancia.\n"
+                "• Wolff et al. (ASCO/CAP 2023, JCO): ~40% de cambio entre IHC 0 e IHC 1+/2+ "
+                "entre muestras pareadas.\n"
+                "• Tarantino et al. (npj Precis Oncol 2026): TTNT más largo en pacientes con "
+                "HER2-low estable entre primario y metástasis (9.4 meses)."
+            )
+
+            # ─── BLOQUE 5: EFICACIA DUAL ───
+            write_block_title(ws2, 32, "BLOQUE 5: EFICACIA DUAL T-DXd")
+            last = total_cells + 1
+            style_cell(ws2, 33, 2, "Score bSPS (Bystander en Negative)", label_font, label_fill, left_align)
+            ws2.cell(row=33, column=3).value = f'=IFERROR(AVERAGEIFS(\'Matriz Espacial\'!Q2:Q{last},\'Matriz Espacial\'!M2:M{last},"Negative"),0)'
+            ws2.cell(row=33, column=3).number_format = '0.0%'
+            ws2.cell(row=33, column=3).font = Font(bold=True, size=14, color="FFFFFF")
+            ws2.cell(row=33, column=3).fill = green_fill
+
+            style_cell(ws2, 34, 2, "Tasa Destrucción Total (P Combinada)", label_font, label_fill, left_align)
+            ws2.cell(row=34, column=3).value = f'=IFERROR(AVERAGE(\'Matriz Espacial\'!R2:R{last}),0)'
+            ws2.cell(row=34, column=3).number_format = '0.0%'
+            ws2.cell(row=34, column=3).font = Font(bold=True, size=16, color="FFFFFF")
+            ws2.cell(row=34, column=3).fill = green_fill
+
+            style_cell(ws2, 35, 2, "Tasa Destrucción Vía Directa", label_font, label_fill, left_align)
+            ws2.cell(row=35, column=3).value = f'=IFERROR(AVERAGE(\'Matriz Espacial\'!N2:N{last}),0)'
+            ws2.cell(row=35, column=3).number_format = '0.0%'
+
+            style_cell(ws2, 36, 2, "Tasa Destrucción Vía Bystander", label_font, label_fill, left_align)
+            ws2.cell(row=36, column=3).value = f'=IFERROR(AVERAGE(\'Matriz Espacial\'!Q2:Q{last}),0)'
+            ws2.cell(row=36, column=3).number_format = '0.0%'
+
+            style_cell(ws2, 37, 2, "Delta Bystander (Ganancia Neta)", label_font, label_fill, left_align)
+            ws2.cell(row=37, column=3).value = '=C34-C35'
+            ws2.cell(row=37, column=3).number_format = '0.0%'
+
+            write_guide(ws2, 32, 37,
+                "GUÍA BLOQUE 5 — EFICACIA DUAL:\n"
+                "• Vía Directa: Internalización del ADC por la propia célula (depende de HER2).\n"
+                "• Vía Bystander: Difusión del DXd libre desde vecinas (topografía espacial).\n"
+                "• P Combinada = 1 - (1-P*Directa)(1-P*Bystander). Eventos independientes.\n"
+                "• Delta Bystander: Ganancia neta del efecto bystander.\n\n"
+                "• Suzuki et al. (CCR 2021): Visualización directa de difusión DXd.\n"
+                "• Khera et al. (MCT 2022): Penetración 30-80 µm cuantificada.\n"
+                "• Tsao et al. (Nat Commun 2025): Liberación extracelular por CTSL "
+                "(no modelada, documentada como limitación)."
+            )
+
+            # ─── BLOQUE 6: DISTRIBUCIÓN TUMORAL ───
+            write_block_title(ws2, 39, "BLOQUE 6: DISTRIBUCIÓN TUMORAL Y HETEROGENEIDAD")
+            style_cell(ws2, 40, 2, "Área Analizada (mm²)", label_font, label_fill, left_align)
+            style_cell(ws2, 40, 3, safe_float(self.area_var.get(), 1.0), label_font, input_fill, center_align, '0.00')
+            style_cell(ws2, 40, 4, "Densidad (Cél/mm²)", label_font, label_fill, left_align)
+            ws2.cell(row=40, column=5).value = '=IF(C40>0,C48/C40,0)'
+            ws2.cell(row=40, column=5).number_format = '#,##0'
+
+            style_cell(ws2, 42, 2, "Categoría IHC", header_font, header_fill, center_align)
+            style_cell(ws2, 42, 3, "Nº Células", header_font, header_fill, center_align)
+            style_cell(ws2, 42, 4, "% del Tumor", header_font, header_fill, center_align)
+
+            cats = [
+                (43, "Negative", "Negative"),
+                (44, "0+ (Ultralow)", "0+"),
+                (45, "1+ (Low)", "1+"),
+                (46, "2+ (Equívoco)", "2+"),
+                (47, "3+ (Sobreexpresión)", "3+")
+            ]
+
+            for row_num, label, cat in cats:
+                style_cell(ws2, row_num, 2, label, label_font, label_fill, left_align)
+                ws2.cell(row=row_num, column=3).value = f'=COUNTIF(\'Matriz Espacial\'!M2:M{last},"{cat}")'
+                ws2.cell(row=row_num, column=3).number_format = '#,##0'
+                ws2.cell(row=row_num, column=3).border = thin_border
+                ws2.cell(row=row_num, column=4).value = f'=IFERROR(C{row_num}/$C$48,0)'
+                ws2.cell(row=row_num, column=4).number_format = '0.0%'
+                ws2.cell(row=row_num, column=4).border = thin_border
+
+            style_cell(ws2, 48, 2, "TOTAL CÉLULAS TUMORALES", label_font, label_fill, left_align)
+            ws2.cell(row=48, column=3).value = '=SUM(C43:C47)'
+            ws2.cell(row=48, column=3).number_format = '#,##0'
+            ws2.cell(row=48, column=3).font = Font(bold=True)
+            ws2.cell(row=48, column=4).value = '=SUM(D43:D47)'
+            ws2.cell(row=48, column=4).number_format = '0.0%'
+
+            style_cell(ws2, 50, 2, "🧬 HER2-HQE (Heterogeneidad)", label_font, label_fill, left_align)
+            ws2.cell(row=50, column=3).value = '=IFERROR(1-(D43^2+D44^2+D45^2+D46^2+D47^2),0)'
+            ws2.cell(row=50, column=3).number_format = '0.0000'
+
+            write_guide(ws2, 39, 50,
+                "GUÍA BLOQUE 6 — DISTRIBUCIÓN Y HETEROGENEIDAD:\n"
+                "La distribución usa la clasificación IHC paramétrica (columna M, Hoja 1), "
+                "no la clasificación visual de QuPath.\n\n"
+                "• HER2-HQE (índice de Simpson invertido): Cuantifica entropía subclonal.\n"
+                "• Hu et al. (Mod Pathol 2026): HQE alto → pCR 24.5% vs 62.5%.\n"
+                "• Metzger Filho et al. (Cancer Discov 2021): pCR 0% en HER2-heterogéneos.\n"
+                "• Goni et al. (Eur J Immunol 2026): La heterogeneidad espacial del antígeno "
+                "es el factor limitante principal de la eficacia de los ADCs."
+            )
+
+            # ─── BLOQUE 7: ESTRATIFICACIÓN ───
+            write_block_title(ws2, 52, "BLOQUE 7: ESTRATIFICACIÓN CELULAR (RIESGO MRD)")
+            style_cell(ws2, 53, 2, "Categoría de Destino", header_font, header_fill, center_align)
+            style_cell(ws2, 53, 3, "Nº Células", header_font, header_fill, center_align)
+            style_cell(ws2, 53, 4, "% del Total", header_font, header_fill, center_align)
+            style_cell(ws2, 53, 5, "Riesgo MRD", header_font, header_fill, center_align)
+
+            destinos = [
+                (54, "Destrucción Letal", "Nulo"),
+                (55, "Destrucción Probable", "Bajo"),
+                (56, "Rescate Parcial", "Alto"),
+                (57, "Supervivencia", "Crítico")
+            ]
+
+            for row_num, dest, riesgo in destinos:
+                style_cell(ws2, row_num, 2, dest, label_font, label_fill, left_align)
+                ws2.cell(row=row_num, column=3).value = f'=COUNTIF(\'Matriz Espacial\'!S2:S{last},"{dest}")'
+                ws2.cell(row=row_num, column=3).number_format = '#,##0'
+                ws2.cell(row=row_num, column=3).border = thin_border
+                ws2.cell(row=row_num, column=4).value = f'=IFERROR(C{row_num}/$C$48,0)'
+                ws2.cell(row=row_num, column=4).number_format = '0.0%'
+                ws2.cell(row=row_num, column=4).border = thin_border
+                style_cell(ws2, row_num, 5, riesgo, label_font, label_fill, center_align)
+
+            style_cell(ws2, 59, 2, "📊 Patrón Topográfico", label_font, label_fill, left_align)
+            ws2.merge_cells('C59:E59')
+            ws2.cell(row=59, column=3).value = '=IF((D54+D55)>=0.6,"CLUSTERED ✅",IF(D57>=0.5,"INSULATED ❌","HETEROGÉNEO ⚠️"))'
+            ws2.cell(row=59, column=3).font = Font(bold=True, size=12)
+            ws2.cell(row=59, column=3).fill = ai_fill
+            ws2.cell(row=59, column=3).alignment = center_align
+
+            write_guide(ws2, 52, 59,
+                "GUÍA BLOQUE 7 — ESTRATIFICACIÓN Y MRD:\n"
+                "Los destinos se asignan según la P Combinada de cada célula (Bloque 3).\n"
+                "• CLUSTERED: ≥60% de células en Destrucción Probable o Letal.\n"
+                "• INSULATED: ≥50% en Supervivencia.\n"
+                "• Riesgo MRD máximo en Supervivencia (clones aislados).\n\n"
+                "• Kapil et al. (ASCO GI 2023): cSPS predice mPFS con T-DXd (8.3 vs 3.9 meses). BM+ en brazo SOC tuvo relación INVERSA "
+                "(HR=2.17), confirmando que el score es predictivo, no meramente pronóstico.\n"
+                "• Ma et al. (Cancer Cell 2025): La agregación espacial de células HER2 3+ determina la respuesta al ADC SHR-A1811."
+            )
+
+            # ─── BLOQUE 8: MÉTRICAS TOPOGRÁFICAS ───
+            write_block_title(ws2, 61, "BLOQUE 8: MÉTRICAS TOPOGRÁFICAS AVANZADAS")
+            style_cell(ws2, 62, 2, "Métrica", header_font, header_fill, center_align)
+            style_cell(ws2, 62, 3, "Valor", header_font, header_fill, center_align)
+            ws2.merge_cells('D62:E62')
+            style_cell(ws2, 62, 4, "Interpretación", header_font, header_fill, center_align)
+
+            istb_rows = [
+                (63, "ISTB Promedio (Negative)", "Negative"),
+                (64, "ISTB Promedio (0+)", "0+"),
+                (65, "ISTB Promedio (1+)", "1+"),
+                (66, "ISTB Promedio (2+)", "2+"),
+                (67, "ISTB Promedio (3+)", "3+")
+            ]
+
+            for row_num, label, cat in istb_rows:
+                style_cell(ws2, row_num, 2, label, label_font, label_fill, left_align)
+                ws2.cell(row=row_num, column=3).value = f'=IFERROR(AVERAGEIFS(\'Matriz Espacial\'!P2:P{last},\'Matriz Espacial\'!M2:M{last},"{cat}"),0)'
+                ws2.cell(row=row_num, column=3).number_format = '0.00'
+                ws2.cell(row=row_num, column=3).border = thin_border
+
+            ws2.merge_cells('D63:E63')
+            ws2.cell(row=63, column=4).value = '=IF(C63>=3,"Exposición alta (Bystander activo)",IF(C63>=1,"Exposición moderada","Exposición mínima"))'
+            ws2.cell(row=63, column=4).border = thin_border
+
+            for r in range(64, 68):
+                ws2.merge_cells(f'D{r}:E{r}')
+                ws2.cell(row=r, column=4).value = f'=IF(C{r}>=5,"Nidos agrupados","Dispersas")'
+                ws2.cell(row=r, column=4).border = thin_border
+
+            style_cell(ws2, 69, 2, "🔀 Ratio Segregación (Neg/1+)", label_font, label_fill, left_align)
+            ws2.cell(row=69, column=3).value = '=IFERROR(C63/C65,0)'
+            ws2.cell(row=69, column=3).number_format = '0.00'
+            ws2.cell(row=69, column=3).border = thin_border
+            ws2.merge_cells('D69:E69')
+            ws2.cell(row=69, column=4).value = '=IF(C69>=0.8,"Sin segregación (Favorable)",IF(C69>=0.4,"Segregación moderada","Segregación severa"))'
+            ws2.cell(row=69, column=4).border = thin_border
+
+            style_cell(ws2, 70, 2, "📡 Cobertura Bystander (PByst > 0.1)", label_font, label_fill, left_align)
+            ws2.cell(row=70, column=3).value = f'=IFERROR(COUNTIFS(\'Matriz Espacial\'!M2:M{last},"Negative",\'Matriz Espacial\'!Q2:Q{last},">0.1")/COUNTIF(\'Matriz Espacial\'!M2:M{last},"Negative"),0)'
+            ws2.cell(row=70, column=3).number_format = '0.0%'
+            ws2.cell(row=70, column=3).border = thin_border
+            ws2.merge_cells('D70:E70')
+            ws2.cell(row=70, column=4).value = '=IF(C70>=0.90,"EXCELENTE",IF(C70>=0.70,"BUENA",IF(C70>=0.50,"MODERADA","POBRE — Insulated")))'
+            ws2.cell(row=70, column=4).border = thin_border
+
+            write_guide(ws2, 61, 70,
+                "GUÍA BLOQUE 8 — TOPOGRAFÍA AVANZADA:\n"
+                "• ISTB Comprimido por categoría: Revela la exposición espacial de cada subpoblación.\n"
+                "• Negative con ISTB alto = bien mezcladas con fuentes HER2+ (favorable).\n"
+                "• Ratio Segregación (Neg/1+): >0.8 mezcla ideal, <0.4 segregación severa.\n"
+                "• Cobertura Bystander: Fracción de Negativas con P_Bystander > 0.1.\n\n"
+                "• Ma et al. (Cancer Cell 2025): Agregación espacial de HER2 3+ determina "
+                "respuesta al ADC.\n"
+                "• Goni et al. (Eur J Immunol 2026): Proponen 'spatial-ADC-scores' integrando "
+                "expresión, fibroblastos y proximidad de células T."
+            )
+
+            # ─── BLOQUE 9: DIAGNÓSTICO FINAL ───
+            write_block_title(ws2, 72, "BLOQUE 9: DIAGNÓSTICO ALGORÍTMICO FINAL")
+            style_cell(ws2, 73, 2, "Fenotipo Detectado", label_font, label_fill, left_align)
+            ws2.cell(row=73, column=3).value = '=IF(D47>=0.1,"HER2 3+",IF((D46+D47)>=0.5,"HER2-Positivo Mixto",IF((D45+D46+D47)>=0.1,"HER2-Low",IF(D44>=0.1,"HER2-Ultralow","HER2-Negative"))))'
+            ws2.cell(row=73, column=3).font = Font(bold=True, size=11)
+            ws2.cell(row=73, column=3).border = thin_border
+
+            style_cell(ws2, 74, 2, "VEREDICTO TERAPÉUTICO", label_font, label_fill, left_align)
+            ws2.merge_cells('C74:E74')
+            ws2.cell(row=74, column=3).value = '=IF(C34>=0.60,"✅ CLUSTERED — Monoterapia ADC",IF(C34>=0.35,"⚠️ HETEROGÉNEO — Considerar combinación","❌ INSULATED — Rotar estrategia"))'
+            ws2.cell(row=74, column=3).font = Font(bold=True, size=12)
+            ws2.cell(row=74, column=3).fill = ai_fill
+            ws2.cell(row=74, column=3).alignment = center_align
+            ws2.cell(row=74, column=3).border = thin_border
+
+            style_cell(ws2, 75, 2, "Predicción de Respuesta", label_font, label_fill, left_align)
+            ws2.merge_cells('C75:E75')
+            ws2.cell(row=75, column=3).value = '="Destrucción esperada: " & TEXT(C34,"0%") & ". Patrón: " & C59'
+            ws2.cell(row=75, column=3).border = thin_border
+
+            style_cell(ws2, 76, 2, "Factor Limitante", label_font, label_fill, left_align)
+            ws2.merge_cells('C76:E76')
+            ws2.cell(row=76, column=3).value = '=IF(C70<0.5,"Aislamiento espacial crítico (Cobertura <50%)",IF(C69<0.4,"Segregación severa (Ratio <0.4)","Sin barreras espaciales severas"))'
+            ws2.cell(row=76, column=3).border = thin_border
+
+            style_cell(ws2, 78, 2, "Alerta Metodológica", label_font, label_fill, left_align)
+            ws2.merge_cells('C78:E78')
+            ws2.cell(row=78, column=3).value = "Parámetros in silico. No modela CTSL estromal (Tsao 2025), eflujo ABCC1 (Sledge 2025), ni pérdida HER2 post-T-DXd (Chen 2025). Requiere validación prospectiva."
+            ws2.cell(row=78, column=3).font = Font(italic=True, size=9, color="C0392B")
+            ws2.cell(row=78, column=3).alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+            ws2.cell(row=78, column=3).border = thin_border
+
+            write_guide(ws2, 72, 78,
+                "GUÍA BLOQUE 9 — DIAGNÓSTICO ALGORÍTMICO:\n"
+                "El veredicto integra la Tasa de Destrucción Total (Bloque 5) con el patrón "
+                "topográfico (Bloque 7).\n"
+                "• Umbrales 60%/35% calibrados para aproximar ORR de DESTINY-Breast04 (52%) "
+                "y DESTINY-Breast06 (62%).\n\n"
+                "• Goni et al. (Eur J Immunol 2026): Los modelos espaciales predictivos deben "
+                "integrar expresión del antígeno, contexto inmune y arquitectura estromal.\n"
+                "• Wood et al. (PLoS Comput Biol 2025): ADCs dirigidos al estroma podrían "
+                "superar a los dirigidos al tumor en expresión heterogénea.\n"
+                "• Tarantino et al. (npj Precis Oncol 2026): Scores cuantitativos continuos "
+                "(HS-HER2, RPPA, HER2DX) predicen TTNT progresivamente por cuartiles."
+            )
+
+            # =====================================================================
+            # HOJA 1: MATRIZ ESPACIAL (Motor Matemático)
+            # =====================================================================
+            self.update_progress(0.4, "2. Construyendo Matriz Espacial...")
+            ws1 = wb.create_sheet("Matriz Espacial")
+
+            # Cabeceras A-L (del Groovy)
+            groovy_headers = list(df.columns)
+
+            # Cabeceras M-T (calculadas)
+            calc_headers = [
+                "M: Categoría IHC", "N: P Directa", "O: ISTB Lineal",
+                "P: ISTB Comprimido", "Q: P Bystander", "R: P Combinada",
+                "S: Destino Celular", "T: Fuente Efectiva"
+            ]
+
+            all_headers = groovy_headers + calc_headers
+
+            for i, h in enumerate(all_headers):
+                col = i + 1
+                cell = ws1.cell(row=1, column=col, value=h)
+                cell.font = header_font if i < len(groovy_headers) else calc_header_font
+                cell.fill = dark_fill if i < len(groovy_headers) else calc_fill
+                cell.border = thin_border
+                cell.alignment = center_align
+                ws1.column_dimensions[get_column_letter(col)].width = 18
+
+            batch_size = max(1, total_cells // 10)
+
+            for idx, row in df.iterrows():
+                r = idx + 2
+                
+                # Columnas A-L: Datos crudos del Groovy
+                for col_idx, val in enumerate(row.tolist()):
+                    ws1.cell(row=r, column=col_idx + 1, value=val)
+
+                # Columna M (col 13): Categoría IHC Paramétrica
+                ws1.cell(row=r, column=13).value = (
+                    f'=IF(B{r}="","",IF(B{r}>=\'Dashboard Clinico V45\'!$C$6,"3+",IF(B{r}>=\'Dashboard Clinico V45\'!$C$5,"2+",IF(B{r}>=\'Dashboard Clinico V45\'!$C$4,"1+",IF(B{r}>=\'Dashboard Clinico V45\'!$C$3,"0+","Negative")))))'
+                )
+
+                # Columna N (col 14): P Directa
+                ws1.cell(row=r, column=14).value = (
+                    f'=IF(B{r}="","",IF(M{r}="3+",\'Dashboard Clinico V45\'!$C$21,IF(M{r}="2+",\'Dashboard Clinico V45\'!$C$20,IF(M{r}="1+",\'Dashboard Clinico V45\'!$C$19,IF(M{r}="0+",\'Dashboard Clinico V45\'!$C$18,0)))))'
+                )
+                ws1.cell(row=r, column=14).number_format = '0.00'
+
+                # Columna O (col 15): ISTB Lineal (Fick con DAB continuo)
+                ws1.cell(row=r, column=15).value = (
+                    f'=IF(B{r}="","",E{r}*EXP(-50/\'Dashboard Clinico V45\'!$C$14)+(F{r}-E{r})*EXP(-75/\'Dashboard Clinico V45\'!$C$14)+(G{r}-F{r})*EXP(-100/\'Dashboard Clinico V45\'!$C$14))'
+                )
+                ws1.cell(row=r, column=15).number_format = '0.0000'
+
+                # Columna P (col 16): ISTB Comprimido
+                ws1.cell(row=r, column=16).value = (
+                    f'=IF(B{r}="","",LN(1+O{r})*\'Dashboard Clinico V45\'!$C$11)'
+                )
+                ws1.cell(row=r, column=16).number_format = '0.00'
+
+                # Columna Q (col 17): P Bystander (Sigmoide)
+                ws1.cell(row=r, column=17).value = (
+                    f'=IF(B{r}="","",1/(1+EXP(-\'Dashboard Clinico V45\'!$C$13*(P{r}-\'Dashboard Clinico V45\'!$C$12))))'
+                )
+                ws1.cell(row=r, column=17).number_format = '0.0%'
+
+                # Columna R (col 18): P Combinada
+                ws1.cell(row=r, column=18).value = (
+                    f'=IF(B{r}="","",1-((1-N{r})*(1-Q{r})))'
+                )
+                ws1.cell(row=r, column=18).number_format = '0.0%'
+
+                # Columna S (col 19): Destino Celular
+                ws1.cell(row=r, column=19).value = (
+                    f'=IF(B{r}="","",IF(R{r}>=\'Dashboard Clinico V45\'!$C$25,"Destrucción Letal",IF(R{r}>=\'Dashboard Clinico V45\'!$C$24,"Destrucción Probable",IF(R{r}>=\'Dashboard Clinico V45\'!$C$23,"Rescate Parcial","Supervivencia"))))'
+                )
+
+                # Columna T (col 20): Fuente Efectiva (DAB propio)
+                ws1.cell(row=r, column=20).value = f'=IF(B{r}="","",B{r})'
+                ws1.cell(row=r, column=20).number_format = '0.0000'
+
+                if (idx + 1) % batch_size == 0:
+                    prog = 0.4 + ((idx + 1) / total_cells) * 0.5
+                    self.update_progress(prog, f"Inyectando fórmulas... {idx+1}/{total_cells} células procesadas.")
+
+            self.update_progress(0.95, "4. Guardando archivo definitivo...")
+            
+            save_dir = self.export_dir if self.export_dir else os.path.dirname(self.csv_path)
+            excel_path = os.path.join(save_dir, 'Tissunomic_CDSS_V45_Definitivo.xlsx')
+            
+            wb.save(excel_path)
+            
+            end_time = time.time()
+            elapsed = end_time - start_time
+            
+            self.after(0, lambda: self.finish_processing(True, f"✅ EXCEL GENERADO CON ÉXITO\n\nCélulas procesadas: {total_cells}\nTiempo: {elapsed:.1f} segundos\n\nArchivo guardado en:\n{excel_path}"))
+            
+        except Exception as e:
+            self.after(0, lambda: self.finish_processing(False, f"❌ ERROR DURANTE LA GENERACIÓN:\n\n{str(e)}"))
+
+    def finish_processing(self, success, msg):
+        self.progress_bar.set(1.0 if success else 0.0)
+        self.btn_generate.configure(state="normal", text="GENERAR EXCEL DEFINITIVO")
+        
+        if success:
+            self.lbl_status.configure(text="Completado exitosamente.", text_color="#2ecc71")
+            messagebox.showinfo("Proceso Completado", msg)
+        else:
+            self.lbl_status.configure(text="Error en la generación.", text_color="#e74c3c")
+            messagebox.showerror("Error", msg)
+
+if __name__ == "__main__":
+    app = CDSSApp()
+    app.mainloop()
